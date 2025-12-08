@@ -8,6 +8,27 @@ Build
 -----
 For usage and build instructions, see the official Raspberry Pi documentation pages [here.](https://www.raspberrypi.com/documentation/computers/camera_software.html#building-libcamera-and-rpicam-apps)
 
+Dependencies:
+
+```
+sudo apt install -y libcamera-dev libepoxy-dev libjpeg-dev libtiff5-dev libpng-dev libopencv-dev
+sudo apt install libavcodec-dev libavdevice-dev libavformat-dev libswresample-dev
+sudo apt install -y cmake libboost-program-options-dev libdrm-dev libexif-dev
+sudo apt install -y meson ninja-build
+
+```
+
+```
+git clone https://github.com/Babyyoda777/rpicam-apps
+
+cd rpicam-apps
+
+meson setup build -Denable_libav=enabled -Denable_drm=enabled -Denable_egl=enabled -Denable_qt=enabled -Denable_opencv=disabled -Denable_tflite=disabled -Denable_hailo=disabled
+
+sudo meson install -C build
+
+```
+
 License
 -------
 
