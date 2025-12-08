@@ -1,3 +1,5 @@
+libtiff_dep = dependency('libtiff-4', required : true)
+
 rpicam_still = executable('rpicam-still', files('rpicam_still.cpp'),
                           include_directories : include_directories('..'),
                           dependencies: [libcamera_dep, boost_dep],
@@ -9,6 +11,12 @@ rpicam_vid = executable('rpicam-vid', files('rpicam_vid.cpp'),
                         dependencies: [libcamera_dep, boost_dep],
                         link_with : rpicam_app,
                         install : true)
+
+rpicam_cinema = executable('rpicam-cinema', files('rpicam_cinema.cpp'),
+                           include_directories : include_directories('..'), # Includes core/
+                           dependencies : [libcamera_dep, boost_dep, libtiff_dep],
+                           link_with : rpicam_app,
+                           install : true)
 
 rpicam_hello = executable('rpicam-hello', files('rpicam_hello.cpp'),
                           include_directories : include_directories('..'),
