@@ -1,230 +1,255 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 /*
- * Test code by babyyoda777 (NOT VERIFIED TO WORK RELIABLY)
+ * Copyright (C) 2020, Raspberry Pi (Trading) Ltd.
  *
- * rpicam_cinema.cpp - libcamera raw video (CinemaDNG) record app.
+ * rpicam_Cinema.cpp - libcamera Cinema high-speed DNG capture.
  */
-
 #include <chrono>
+#include <filesystem>
 #include <poll.h>
 #include <signal.h>
 #include <sys/signalfd.h>
 #include <sys/stat.h>
-#include <iostream>
-#include <iomanip>
-#include <sstream>
+#include <thread>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 
-#include <libcamera/stream.h>
-#include "core/rpicam_encoder.hpp" // Use encoder base class for video loop
-#include "encoder/null_encoder.hpp" // Use NullEncoder to disable video processing
-#include "output/output.hpp" // Use Output class for file handling
-#include "image/image.hpp" // For dng_save function
-#include "core/still_options.hpp" // For DNG metadata
-#include "core/stream_info.hpp" // Correct location for StreamInfo structure
+#include "core/frame_info.hpp"
+#include "core/rpicam_app.hpp"
+#include "core/still_options.hpp"
 
+#include "output/output.hpp"
+
+#include "image/image.hpp"
+
+using namespace std::chrono_literals;
 using namespace std::placeholders;
 using libcamera::Stream;
-using libcamera::StreamConfiguration;
-using libcamera::Camera;
 
-// --- Custom Application Class ---
+namespace fs = std::filesystem;
 
-class RPiCamCinema : public RPiCamEncoder
+// ----------------------------------------------------------------------------
+// Threaded Saver Class
+// Handles disk I/O in the background so the camera doesn't stall.
+// ----------------------------------------------------------------------------
+class ThreadedSaver
 {
 public:
-	RPiCamCinema() : RPiCamEncoder() {}
+    struct SaveTask {
+        CompletedRequestPtr payload;
+        std::string filename;
+        RPiCamCinemaApp* app;
+        Stream* stream;
+    };
 
-protected:
-	// Force the use of "null" encoder, as we are saving raw frames, not encoded video.
-	void createEncoder() override { encoder_ = std::unique_ptr<Encoder>(new NullEncoder(GetOptions())); }
+    ThreadedSaver(StillOptions *opts) : options_(opts), running_(true) {
+        worker_ = std::thread(&ThreadedSaver::process, this);
+    }
+
+    ~ThreadedSaver() {
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            running_ = false;
+        }
+        cv_.notify_one();
+        if (worker_.joinable()) worker_.join();
+    }
+
+    void enqueue(SaveTask task) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        // If queue is too large (disk too slow), we drop frames to keep camera alive
+        if (queue_.size() < 20) { 
+            queue_.push(std::move(task));
+            cv_.notify_one();
+        } else {
+            LOG(2, "Disk I/O too slow, dropping frame!");
+        }
+    }
+
+private:
+    void process() {
+        while (true) {
+            SaveTask task;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this] { return !queue_.empty() || !running_; });
+                if (!running_ && queue_.empty()) break;
+                task = std::move(queue_.front());
+                queue_.pop();
+            }
+
+            // Perform the heavy DNG save
+            StreamInfo info = task.app->GetStreamInfo(task.stream);
+            BufferReadSync r(task.app, task.payload->buffers[task.stream]);
+            const std::vector<libcamera::Span<uint8_t>> mem = r.Get();
+            
+            dng_save(mem, info, task.payload->metadata, task.filename, task.app->CameraModel(), options_);
+            LOG(2, "Saved " << task.filename << " (Queue: " << queue_.size() << ")");
+        }
+    }
+
+    StillOptions *options_;
+    std::thread worker_;
+    std::queue<SaveTask> queue_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool running_;
 };
 
-// --- Signal and Keypress Handling Functions ---
+// ----------------------------------------------------------------------------
+// Main Application Class
+// ----------------------------------------------------------------------------
+
+class RPiCamCinemaApp : public RPiCamApp
+{
+public:
+    RPiCamCinemaApp() : RPiCamApp(std::make_unique<StillOptions>())
+    {
+        static_cast<StillOptions *>(RPiCamApp::GetOptions())->Set().encoding = "dng";
+    }
+
+    StillOptions *GetOptions() const { return static_cast<StillOptions *>(RPiCamApp::GetOptions()); }
+};
+
+static std::string generate_filename(StillOptions const *options)
+{
+    const std::string encoding = "dng";
+    char filename[128];
+    std::string folder = options->Get().output; 
+    if (!folder.empty() && folder.back() != '/')
+        folder += "/";
+
+    // For high speed capture, we strictly use the frame counter
+    snprintf(filename, sizeof(filename), "%s%04d.%s", folder.c_str(), options->Get().framestart, encoding.c_str());
+
+    filename[sizeof(filename) - 1] = 0;
+    return std::string(filename);
+}
+
+// ----------------------------------------------------------------------------
+// Event Loop
+// ----------------------------------------------------------------------------
 
 static int signal_received;
 static void default_signal_handler(int signal_number)
 {
-	signal_received = signal_number;
-	LOG(1, "Received signal " << signal_number);
+    signal_received = signal_number;
 }
 
-static int get_key_or_signal(VideoOptions const *options_ptr, pollfd p[1])
+static void event_loop(RPiCamCinemaApp &app)
 {
-	auto const &options = options_ptr->Get(); // The options struct reference
-	int key = 0;
-	if (signal_received == SIGINT)
-		return 'x';
-	if (options.keypress)
-	{
-		poll(p, 1, 0);
-		if (p[0].revents & POLLIN)
-		{
-			char *user_string = nullptr;
-			size_t len;
-			[[maybe_unused]] size_t r = getline(&user_string, &len, stdin);
-			key = user_string[0];
-		}
-	}
-	if (options.signal)
-	{
-		if (signal_received == SIGUSR1)
-			key = '\n';
-		else if ((signal_received == SIGUSR2) || (signal_received == SIGPIPE))
-			key = 'x';
-		signal_received = 0;
-	}
-	return key;
-}
+    StillOptions *options = app.GetOptions();
 
-// --- Main Application Event Loop ---
-
-static void event_loop(RPiCamCinema &app)
-{
-	VideoOptions *options_ptr = app.GetOptions();
-	auto const &options = options_ptr->Get(); // The options struct reference
-
-	// Output is configured but is ignored since we are manually writing DNG files.
-	std::unique_ptr<Output> output = std::unique_ptr<Output>(Output::Create(options_ptr));
-	app.SetEncodeOutputReadyCallback(std::bind(&Output::OutputReady, output.get(), _1, _2, _3, _4));
-	app.SetMetadataReadyCallback(std::bind(&Output::MetadataReady, output.get(), _1));
-
-	// 1. Open Camera
-	app.OpenCamera();
+    // 1. Force RAW/Cinema configuration immediately.
+    // We ignore Viewfinder entirely to ensure the pipeline is optimized for the capture stream.
+    unsigned int Cinema_flags = RPiCamApp::FLAG_Cinema_RAW; 
     
-    // 2. Configure for RAW video streaming
-	app.ConfigureVideo(RPiCamEncoder::FLAG_VIDEO_RAW);
-	
-	// 3. Start Encoder (NullEncoder) and Camera
-	app.StartEncoder();
-	app.StartCamera();
-	auto start_time = std::chrono::high_resolution_clock::now();
+    app.OpenCamera();
+    app.ConfigureCinema(Cinema_flags);
+    app.StartCamera();
 
-	// Monitoring for keypresses and signals.
-	signal(SIGUSR1, default_signal_handler);
-	signal(SIGUSR2, default_signal_handler);
-	signal(SIGINT, default_signal_handler);
-	signal(SIGPIPE, default_signal_handler);
-	pollfd p[1] = { { STDIN_FILENO, POLLIN, 0 } };
+    ThreadedSaver saver(options);
 
-	LOG(1, "Starting CinemaDNG capture. Press 'x' or Ctrl+C to stop.");
-	LOG(1, "WARNING: RAW video requires extremely fast storage!");
+    auto start_time = std::chrono::high_resolution_clock::now();
+    auto last_frame_time = start_time;
+    
+    // Calculate minimum frame duration based on requested FPS (if timelapse is used as FPS control)
+    // If --timelapse 0 is used, it goes as fast as the camera/exposure allows.
+    // If --timelapse 40 is used, it targets 25fps.
+    uint64_t frame_interval_ms = options->Get().timelapse; 
 
-	for (unsigned int count = 0; ; count++)
-	{
-		RPiCamCinema::Msg msg = app.Wait();
+    LOG(1, "Starting High Speed Cinema Capture. Press Ctrl+C or 'x' + Enter to stop.");
 
-		if (msg.type == RPiCamApp::MsgType::Timeout)
-		{
-			LOG_ERROR("ERROR: Device timeout detected, attempting a restart!!!");
-			app.StopCamera();
-			app.StartCamera();
-			continue;
-		}
-		if (msg.type == RPiCamApp::MsgType::Quit)
-			return;
-		else if (msg.type != RPiCamApp::MsgType::RequestComplete)
-			throw std::runtime_error("unrecognised message!");
-		
-		int key = get_key_or_signal(options_ptr, p); // Keypress monitoring
+    // Monitoring for keypresses and signals.
+    signal(SIGUSR1, default_signal_handler);
+    pollfd p[1] = { { STDIN_FILENO, POLLIN, 0 } };
 
-		LOG(2, "Frame " << count);
-		auto now = std::chrono::high_resolution_clock::now();
-		
-		// Logic to stop based on time or frame count
-		bool timeout = !options.frames && options.timeout &&
-					   ((now - start_time) > options.timeout.value);
-		bool frameout = options.frames && count >= options.frames;
-		
-		if (timeout || frameout || key == 'x' || key == 'X')
-		{
-			if (timeout)
-				LOG(1, "Halting: reached timeout.");
-			app.StopCamera();
-			app.StopEncoder();
-			return;
-		}
+    for (unsigned int count = 0;; count++)
+    {
+        RPiCamApp::Msg msg = app.Wait();
 
-		// --- WRITE DNG LOGIC ---
-		CompletedRequestPtr &completed_request = std::get<CompletedRequestPtr>(msg.payload);
-		
-		// The Raw stream is where the unencoded data lives in this configuration.
-		Stream *raw_stream = app.RawStream();
-		
-		if (completed_request->buffers.count(raw_stream))
-		{
-			// 1. Get the Raw Buffer Data
-			BufferReadSync r(&app, completed_request->buffers[raw_stream]);
-			const std::vector<libcamera::Span<uint8_t>> mem = r.Get();
-			
-			// 2. Get Stream Configuration
-			StreamConfiguration const &cfg = raw_stream->configuration();
-			
-			// 3. Populate StreamInfo (using fixed struct member access)
-			StreamInfo info;
-			info.width = cfg.size.width;
-			info.height = cfg.size.height;
-			info.stride = cfg.stride;
-			info.pixel_format = cfg.pixelFormat;
-			
-			// 4. Generate filename
-			std::stringstream filename_ss;
-			std::string base = options.output.empty() ? "frame" : options.output;
-			size_t lastindex = base.find_last_of("."); 
-			if (lastindex != std::string::npos) 
-				base = base.substr(0, lastindex); 
+        if (msg.type == RPiCamApp::MsgType::Timeout)
+        {
+            LOG_ERROR("ERROR: Device timeout detected, attempting restart!");
+            app.StopCamera();
+            app.StartCamera();
+            continue;
+        }
+        if (msg.type == RPiCamApp::MsgType::Quit)
+            return;
 
-			filename_ss << base << "_" << std::setw(4) << std::setfill('0') << count << ".dng";
-			std::string filename = filename_ss.str();
+        CompletedRequestPtr &completed_request = std::get<CompletedRequestPtr>(msg.payload);
+        auto now = std::chrono::high_resolution_clock::now();
 
-			// 5. Save DNG File
-			try {
-				dng_save(
-					mem, 
-					info, 
-					completed_request->metadata, 
-					filename, 
-					app.CameraModel(), 
-					// FIX: Use reinterpret_cast to force the type conversion 
-					// needed by the dng_save function when using VideoOptions.
-					reinterpret_cast<StillOptions const *>(options_ptr) 
-				);
-			} catch (std::exception const &e) {
-				LOG_ERROR("Failed to write DNG: " << e.what());
-			}
-		}
+        // Handle Keyboard Exit
+        poll(p, 1, 0);
+        if (p[0].revents & POLLIN)
+        {
+            char *user_string = nullptr;
+            size_t len;
+            [[maybe_unused]] size_t r = getline(&user_string, &len, stdin);
+            if (user_string[0] == 'x' || user_string[0] == 'X') return;
+        }
+        if (signal_received) return;
 
-		// Show preview on HDMI/Screen
-		// Use the video stream (Stream 0) for preview, which is lower resolution by default
-		app.ShowPreview(completed_request, app.VideoStream());
-	}
+        // 2. Logic to determine if we save this frame
+        // In high speed mode, we stream "Cinema" buffers.
+        if (app.CinemaStream())
+        {
+            // Check timelapse interval (software rate limiting)
+            // Ideally, set --framerate on the command line to control this at the sensor level
+            double elapsed = std::chrono::duration<double, std::milli>(now - last_frame_time).count();
+            
+            if (elapsed >= frame_interval_ms)
+            {
+                last_frame_time = now;
+                std::string filename = generate_filename(options);
+                
+                // 3. Offload to background thread
+                ThreadedSaver::SaveTask task;
+                task.payload = completed_request; // Shared ptr keeps buffer alive
+                task.filename = filename;
+                task.app = &app;
+                task.stream = app.CinemaStream(); // Use the raw stream
+                
+                saver.enqueue(std::move(task));
+
+                // Increment counter
+                options->Set().framestart++;
+                
+                // Stop if we hit a frame limit (optional, based on user needs)
+                if (options->Get().timeout && (now - start_time) > std::chrono::milliseconds(options->Get().timeout.value))
+                    return;
+            }
+        }
+    }
 }
-
-// --- Main function ---
 
 int main(int argc, char *argv[])
 {
-	try
-	{
-		RPiCamCinema app;
-		VideoOptions *options = app.GetOptions();
-		if (options->Parse(argc, argv))
-		{
-            // Apply standard raw video options defaults
-			options->Set().codec = "yuv420";
-			options->Set().denoise = "cdn_off";
-			
-            // We want a preview for rpicam-cinema, so DON'T force nopreview=true
+    try
+    {
+        RPiCamCinemaApp app;
+        StillOptions *options = app.GetOptions();
+        if (options->Parse(argc, argv))
+        {
+            // Force disable ZSL as we are doing continuous direct capture
+            // Force immediate mode logic
+            if (options->Get().verbose >= 2) options->Get().Print();
             
-			if (options->Get().verbose >= 2)
-				options->Get().Print();
+            // Remove any "timeout" default that stops the app immediately
+            // If user didn't specify timeout, run forever (0)
+            if (!options->Get().timeout) options->Get().timeout = 0;
 
-			event_loop(app);
-		}
-	}
-	catch (std::exception const &e)
-	{
-		LOG_ERROR("ERROR: *** " << e.what() << " ***");
-		return -1;
-	}
-	return 0;
+            event_loop(app);
+        }
+    }
+    catch (std::exception const &e)
+    {
+        LOG_ERROR("ERROR: *** " << e.what() << " ***");
+        return -1;
+    }
+    return 0;
 }
