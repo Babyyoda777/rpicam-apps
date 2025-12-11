@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 /*
- * Copyright (C) 2020, Raspberry Pi (Trading) Ltd.
  *
  * rpicam_Cinema.cpp - libcamera Cinema high-speed DNG capture.
  */
@@ -19,9 +18,7 @@
 #include "core/frame_info.hpp"
 #include "core/rpicam_app.hpp"
 #include "core/still_options.hpp"
-
 #include "output/output.hpp"
-
 #include "image/image.hpp"
 
 using namespace std::chrono_literals;
@@ -30,9 +27,11 @@ using libcamera::Stream;
 
 namespace fs = std::filesystem;
 
+// 1. Forward Declaration
+class RPiCamCinemaApp;
+
 // ----------------------------------------------------------------------------
-// Threaded Saver Class
-// Handles disk I/O in the background so the camera doesn't stall.
+// Threaded Saver Class Definition
 // ----------------------------------------------------------------------------
 class ThreadedSaver
 {
@@ -44,51 +43,13 @@ public:
         Stream* stream;
     };
 
-    ThreadedSaver(StillOptions *opts) : options_(opts), running_(true) {
-        worker_ = std::thread(&ThreadedSaver::process, this);
-    }
+    ThreadedSaver(StillOptions *opts);
+    ~ThreadedSaver();
 
-    ~ThreadedSaver() {
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-            running_ = false;
-        }
-        cv_.notify_one();
-        if (worker_.joinable()) worker_.join();
-    }
-
-    void enqueue(SaveTask task) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        // If queue is too large (disk too slow), we drop frames to keep camera alive
-        if (queue_.size() < 20) { 
-            queue_.push(std::move(task));
-            cv_.notify_one();
-        } else {
-            LOG(2, "Disk I/O too slow, dropping frame!");
-        }
-    }
+    void enqueue(SaveTask task);
 
 private:
-    void process() {
-        while (true) {
-            SaveTask task;
-            {
-                std::unique_lock<std::mutex> lock(mutex_);
-                cv_.wait(lock, [this] { return !queue_.empty() || !running_; });
-                if (!running_ && queue_.empty()) break;
-                task = std::move(queue_.front());
-                queue_.pop();
-            }
-
-            // Perform the heavy DNG save
-            StreamInfo info = task.app->GetStreamInfo(task.stream);
-            BufferReadSync r(task.app, task.payload->buffers[task.stream]);
-            const std::vector<libcamera::Span<uint8_t>> mem = r.Get();
-            
-            dng_save(mem, info, task.payload->metadata, task.filename, task.app->CameraModel(), options_);
-            LOG(2, "Saved " << task.filename << " (Queue: " << queue_.size() << ")");
-        }
-    }
+    void process();
 
     StillOptions *options_;
     std::thread worker_;
@@ -113,6 +74,58 @@ public:
     StillOptions *GetOptions() const { return static_cast<StillOptions *>(RPiCamApp::GetOptions()); }
 };
 
+// ----------------------------------------------------------------------------
+// Threaded Saver Implementation
+// ----------------------------------------------------------------------------
+
+ThreadedSaver::ThreadedSaver(StillOptions *opts) : options_(opts), running_(true) {
+    worker_ = std::thread(&ThreadedSaver::process, this);
+}
+
+ThreadedSaver::~ThreadedSaver() {
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        running_ = false;
+    }
+    cv_.notify_one();
+    if (worker_.joinable()) worker_.join();
+}
+
+void ThreadedSaver::enqueue(SaveTask task) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    // Limit queue size to prevent OOM
+    if (queue_.size() < 40) { 
+        queue_.push(std::move(task));
+        cv_.notify_one();
+    } else {
+        LOG(2, "Disk I/O too slow, dropping frame!");
+    }
+}
+
+void ThreadedSaver::process() {
+    while (true) {
+        SaveTask task;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait(lock, [this] { return !queue_.empty() || !running_; });
+            if (!running_ && queue_.empty()) break;
+            task = std::move(queue_.front());
+            queue_.pop();
+        }
+
+        StreamInfo info = task.app->GetStreamInfo(task.stream);
+        BufferReadSync r(task.app, task.payload->buffers[task.stream]);
+        const std::vector<libcamera::Span<uint8_t>> mem = r.Get();
+        
+        dng_save(mem, info, task.payload->metadata, task.filename, task.app->CameraModel(), options_);
+        LOG(2, "Saved " << task.filename << " (Queue: " << queue_.size() << ")");
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Helper Functions
+// ----------------------------------------------------------------------------
+
 static std::string generate_filename(StillOptions const *options)
 {
     const std::string encoding = "dng";
@@ -121,16 +134,9 @@ static std::string generate_filename(StillOptions const *options)
     if (!folder.empty() && folder.back() != '/')
         folder += "/";
 
-    // For high speed capture, we strictly use the frame counter
     snprintf(filename, sizeof(filename), "%s%04d.%s", folder.c_str(), options->Get().framestart, encoding.c_str());
-
-    filename[sizeof(filename) - 1] = 0;
     return std::string(filename);
 }
-
-// ----------------------------------------------------------------------------
-// Event Loop
-// ----------------------------------------------------------------------------
 
 static int signal_received;
 static void default_signal_handler(int signal_number)
@@ -138,16 +144,18 @@ static void default_signal_handler(int signal_number)
     signal_received = signal_number;
 }
 
+// ----------------------------------------------------------------------------
+// Event Loop
+// ----------------------------------------------------------------------------
+
 static void event_loop(RPiCamCinemaApp &app)
 {
     StillOptions *options = app.GetOptions();
 
-    // 1. Force RAW/Cinema configuration immediately.
-    // We ignore Viewfinder entirely to ensure the pipeline is optimized for the capture stream.
-    unsigned int Cinema_flags = RPiCamApp::FLAG_Cinema_RAW; 
+    unsigned int flags = RPiCamApp::FLAG_STILL_RAW;
     
     app.OpenCamera();
-    app.ConfigureCinema(Cinema_flags);
+    app.ConfigureStill(flags);
     app.StartCamera();
 
     ThreadedSaver saver(options);
@@ -155,14 +163,12 @@ static void event_loop(RPiCamCinemaApp &app)
     auto start_time = std::chrono::high_resolution_clock::now();
     auto last_frame_time = start_time;
     
-    // Calculate minimum frame duration based on requested FPS (if timelapse is used as FPS control)
-    // If --timelapse 0 is used, it goes as fast as the camera/exposure allows.
-    // If --timelapse 40 is used, it targets 25fps.
-    uint64_t frame_interval_ms = options->Get().timelapse; 
+    // FIX 1 (Line 174): .get() returns an integer, so we don't use .count()
+    // It is already the millisecond count.
+    uint64_t frame_interval_ms = options->Get().timelapse.get();
 
     LOG(1, "Starting High Speed Cinema Capture. Press Ctrl+C or 'x' + Enter to stop.");
 
-    // Monitoring for keypresses and signals.
     signal(SIGUSR1, default_signal_handler);
     pollfd p[1] = { { STDIN_FILENO, POLLIN, 0 } };
 
@@ -183,7 +189,7 @@ static void event_loop(RPiCamCinemaApp &app)
         CompletedRequestPtr &completed_request = std::get<CompletedRequestPtr>(msg.payload);
         auto now = std::chrono::high_resolution_clock::now();
 
-        // Handle Keyboard Exit
+        // Handle Exit
         poll(p, 1, 0);
         if (p[0].revents & POLLIN)
         {
@@ -194,12 +200,9 @@ static void event_loop(RPiCamCinemaApp &app)
         }
         if (signal_received) return;
 
-        // 2. Logic to determine if we save this frame
-        // In high speed mode, we stream "Cinema" buffers.
-        if (app.CinemaStream())
+        if (app.RawStream())
         {
-            // Check timelapse interval (software rate limiting)
-            // Ideally, set --framerate on the command line to control this at the sensor level
+            // Time check for frame interval
             double elapsed = std::chrono::duration<double, std::milli>(now - last_frame_time).count();
             
             if (elapsed >= frame_interval_ms)
@@ -207,25 +210,34 @@ static void event_loop(RPiCamCinemaApp &app)
                 last_frame_time = now;
                 std::string filename = generate_filename(options);
                 
-                // 3. Offload to background thread
                 ThreadedSaver::SaveTask task;
-                task.payload = completed_request; // Shared ptr keeps buffer alive
+                task.payload = completed_request; 
                 task.filename = filename;
                 task.app = &app;
-                task.stream = app.CinemaStream(); // Use the raw stream
+                task.stream = app.RawStream(); 
                 
                 saver.enqueue(std::move(task));
 
-                // Increment counter
                 options->Set().framestart++;
                 
-                // Stop if we hit a frame limit (optional, based on user needs)
-                if (options->Get().timeout && (now - start_time) > std::chrono::milliseconds(options->Get().timeout.value))
-                    return;
+                // FIX 2 & 3: Handle Type Mismatch for Timeout
+                // Compare the raw integer (.get()) to 0
+                if (options->Get().timeout.get() > 0)
+                {
+                    // Convert the raw integer timeout to a chrono duration for comparison with 'now'
+                    // This resolves the error on line 231 (now - start_time) > timeout_integer
+                    auto timeout_duration = std::chrono::milliseconds(options->Get().timeout.get());
+                    if ((now - start_time) > timeout_duration)
+                        return;
+                }
             }
         }
     }
 }
+
+// ----------------------------------------------------------------------------
+// Main Function
+// ----------------------------------------------------------------------------
 
 int main(int argc, char *argv[])
 {
@@ -235,13 +247,11 @@ int main(int argc, char *argv[])
         StillOptions *options = app.GetOptions();
         if (options->Parse(argc, argv))
         {
-            // Force disable ZSL as we are doing continuous direct capture
-            // Force immediate mode logic
             if (options->Get().verbose >= 2) options->Get().Print();
             
-            // Remove any "timeout" default that stops the app immediately
-            // If user didn't specify timeout, run forever (0)
-            if (!options->Get().timeout) options->Get().timeout = 0;
+            // FIX 4 (Line 248): Must use Set() for mutable access. 
+            // options->Get() returns a const reference, preventing the call to .set().
+            if (!options->Get().timeout) options->Set().timeout.set(0);
 
             event_loop(app);
         }
