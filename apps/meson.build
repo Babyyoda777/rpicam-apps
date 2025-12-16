@@ -28,6 +28,12 @@ rpicam_jpeg = executable('rpicam-jpeg', files('rpicam_jpeg.cpp'),
                          link_with : rpicam_app,
                          install : true)
 
+rpicam_cinema = executable('rpicam-cinema', files('rpicam_cinema.cpp'),
+                           include_directories : include_directories('..'),
+                           dependencies: [libcamera_dep, boost_dep],
+                           link_with : rpicam_app,
+                           install : true)
+
 if enable_tflite
     rpicam_detect = executable('rpicam-detect', files('rpicam_detect.cpp'),
                                include_directories : include_directories('..'),
