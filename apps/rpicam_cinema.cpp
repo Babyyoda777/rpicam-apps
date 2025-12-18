@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 /*
- * rpicam_cinema.cpp - High Performance RAW Capture
+ * rpicam_cinema.cpp - Preview-capable RAW CinemaDNG sequence capture app.
  *
- * - Captures .raw files + metadata.json (No DNG conversion on Pi).
- * - Forces user-defined Framerate, Gain, and Shutter.
+ * Performance Optimized:
+ * - Single-File Write: Streams all frames to one 'movie.raw' file to maximize NVMe bandwidth.
+ * - Deferred Conversion: Extracts DNGs from 'movie.raw' after recording.
  */
 
 #include <atomic>
@@ -29,6 +30,8 @@
 #include "core/stream_info.hpp"
 #include "core/cinema_options.hpp"
 
+#include "image/image.hpp"
+
 using namespace std::chrono_literals;
 using libcamera::Stream;
 namespace fs = std::filesystem;
@@ -42,12 +45,11 @@ public:
 
 struct FrameJob
 {
-	std::string raw_filename; // Temporary RAW filename
-	std::string dng_filename; // Intended DNG filename (for metadata)
+	std::string filename; // Final DNG filename
 	StreamInfo info;
-	float exposure_ms;
-	float gain;
-	std::vector<uint8_t> bytes;
+	libcamera::ControlList metadata;
+	std::vector<uint8_t> bytes; // Frame data (cleared after writing to disk)
+	size_t size; // Size of the data (needed for read-back)
 };
 
 static void ensure_output_dirs(fs::path const &base, std::string const &reel, std::string const &clip)
@@ -59,11 +61,11 @@ static void ensure_output_dirs(fs::path const &base, std::string const &reel, st
 		throw std::runtime_error("Failed to create output directory: " + dir.string() + " (" + ec.message() + ")");
 }
 
-static std::string make_filename(fs::path const &base, std::string const &reel, std::string const &clip,
-									  uint32_t frame, const char* ext)
+static std::string make_frame_filename(fs::path const &base, std::string const &reel, std::string const &clip,
+									  uint32_t frame_1_based)
 {
 	char name[32];
-	std::snprintf(name, sizeof(name), "%06u.%s", frame, ext);
+	std::snprintf(name, sizeof(name), "%06u.dng", frame_1_based);
 	return (base / reel / clip / name).string();
 }
 
@@ -118,95 +120,150 @@ private:
 	bool stop_ = false;
 };
 
-// Writes RAW bytes to disk
-static void writer_thread_func(FrameQueue &q, std::vector<FrameJob> &meta_jobs, 
-                               std::mutex &meta_mutex, std::atomic<uint64_t> &written_counter)
+struct FpsWindow
 {
+	std::deque<std::chrono::steady_clock::time_point> ts;
+	std::chrono::milliseconds window { 2000 };
+
+	void push(std::chrono::steady_clock::time_point t)
+	{
+		ts.push_back(t);
+		while (!ts.empty() && (t - ts.front()) > window)
+			ts.pop_front();
+	}
+
+	double fps() const
+	{
+		if (ts.size() < 2)
+			return 0.0;
+		double secs = std::chrono::duration<double>(ts.back() - ts.front()).count();
+		if (secs <= 0.0)
+			return 0.0;
+		return (double)(ts.size() - 1) / secs;
+	}
+};
+
+// Thread to write to a SINGLE file (sequential append)
+static void writer_thread_func(FrameQueue &q, std::vector<FrameJob> &deferred_jobs, 
+                               std::mutex &deferred_mutex, std::atomic<uint64_t> &written_counter,
+                               std::string const &raw_path)
+{
+	// Open single large file for appending
+	FILE* fp = fopen(raw_path.c_str(), "wb");
+	if (!fp) {
+		LOG_ERROR("CRITICAL: Failed to open raw container: " << raw_path);
+		return;
+	}
+
 	FrameJob job;
 	while (q.pop(job))
 	{
-		try
-		{
-			std::ofstream raw_file(job.raw_filename, std::ios::binary);
-			if (raw_file)
-			{
-				raw_file.write(reinterpret_cast<const char*>(job.bytes.data()), job.bytes.size());
-				raw_file.close();
-				written_counter.fetch_add(1, std::memory_order_relaxed);
-
-				// Free memory
-				job.bytes.clear();
-				job.bytes.shrink_to_fit();
-
-				// Save metadata for JSON export
-				{
-					std::lock_guard<std::mutex> lk(meta_mutex);
-					meta_jobs.push_back(std::move(job));
-				}
-			}
+		size_t w = fwrite(job.bytes.data(), 1, job.bytes.size(), fp);
+		if (w != job.bytes.size()) {
+			LOG_ERROR("Write error! Expected " << job.bytes.size() << " wrote " << w);
 		}
-		catch (std::exception const &e)
-		{
-			std::cerr << "Write error: " << e.what() << std::endl;
-		}
-	}
-}
 
-static void save_metadata_json(std::vector<FrameJob> &jobs, fs::path const &output_dir)
-{
-	std::cout << "\nSaving metadata.json for " << jobs.size() << " frames..." << std::endl;
-	fs::path json_path = output_dir / "metadata.json";
-	std::ofstream f(json_path);
-	
-	f << "[\n";
-	for (size_t i = 0; i < jobs.size(); ++i)
-	{
-		auto &j = jobs[i];
-		fs::path raw_p(j.raw_filename);
+		// Save the size for read-back
+		job.size = job.bytes.size();
 		
-		f << "  {\n";
-		f << "    \"raw_file\": \"" << raw_p.filename().string() << "\",\n";
-		f << "    \"width\": " << j.info.width << ",\n";
-		f << "    \"height\": " << j.info.height << ",\n";
-		f << "    \"stride\": " << j.info.stride << ",\n";
-		f << "    \"exposure_ms\": " << j.exposure_ms << ",\n";
-		f << "    \"analogue_gain\": " << j.gain << "\n";
-		f << "  }" << (i < jobs.size() - 1 ? "," : "") << "\n";
+		// Clear memory to free up RAM for the next frames
+		job.bytes.clear();
+		job.bytes.shrink_to_fit();
+
+		{
+			std::lock_guard<std::mutex> lk(deferred_mutex);
+			deferred_jobs.push_back(std::move(job));
+		}
+
+		written_counter.fetch_add(1, std::memory_order_relaxed);
 	}
-	f << "]\n";
-	std::cout << "Done. Transfer the folder to Mac and run dng_convert.py" << std::endl;
+	fclose(fp);
 }
 
 static void disable_auto_exposure(RPiCamCinemaApp &app)
 {
 	libcamera::ControlList cl;
 	cl.set(libcamera::controls::AeEnable, false);
-	
-	CinemaOptions *options = app.GetOptions();
-	if (options->Get().gain > 0.0f)
-		cl.set(libcamera::controls::AnalogueGain, options->Get().gain);
-	if (options->Get().shutter)
-		cl.set(libcamera::controls::ExposureTime, options->Get().shutter.get<std::chrono::microseconds>());
-
 	app.SetControls(cl);
+}
+
+static void convert_deferred_frames(std::vector<FrameJob> &jobs, std::string const &cam_model, CinemaOptions const *options, std::string const &raw_path)
+{
+	std::cout << "\nStarting Post-Processing (Extracting " << jobs.size() << " DNGs from container)...\n";
+	
+	FILE* fp = fopen(raw_path.c_str(), "rb");
+	if (!fp) {
+		LOG_ERROR("Failed to open raw container for reading: " << raw_path);
+		return;
+	}
+
+	int count = 0;
+	int total = jobs.size();
+
+	// We assume jobs are in the same order they were written (FIFO queue)
+	for (auto &job : jobs)
+	{
+		count++;
+		if (count % 10 == 0)
+			std::cout << "Processing " << count << "/" << total << "\r" << std::flush;
+
+		try 
+		{
+			std::vector<uint8_t> data(job.size);
+			size_t r = fread(data.data(), 1, job.size, fp);
+			
+			if (r != job.size) {
+				LOG_ERROR("Read error on frame " << count << ". Expected " << job.size << " got " << r);
+				break;
+			}
+
+			// Construct memory span for dng_save
+			std::vector<libcamera::Span<uint8_t>> mem;
+			mem.emplace_back(data.data(), data.size());
+
+			dng_save(mem, job.info, job.metadata, job.filename, cam_model, options);
+		}
+		catch (std::exception const &e)
+		{
+			LOG_ERROR("Error processing frame " << job.filename << ": " << e.what());
+		}
+	}
+	fclose(fp);
+	
+	// Optional: Remove the big raw file after success
+	// fs::remove(raw_path);
+	std::cout << "\nPost-Processing Complete.\n";
 }
 
 static void event_loop(RPiCamCinemaApp &app)
 {
 	CinemaOptions *options = app.GetOptions();
+
+	if (options->Get().output.empty())
+		throw std::runtime_error("No output directory specified. Use -o <dir>.");
+
 	fs::path output_base = options->Get().output;
 	ensure_output_dirs(output_base, options->Reel(), options->Clip());
-	fs::path clip_dir = output_base / options->Reel() / options->Clip();
+
+	// Path for the single massive raw file
+	std::string big_raw_path = (output_base / options->Reel() / options->Clip() / "movie.raw").string();
+
+	unsigned int still_flags = RPiCamApp::FLAG_STILL_RAW;
 
 	app.OpenCamera();
-	if (!options->Get().zsl) options->Set().zsl = true;
-	app.ConfigureZsl(RPiCamApp::FLAG_STILL_RAW);
+
+	if (!options->Get().zsl)
+		options->Set().zsl = true;
+	app.ConfigureZsl(still_flags);
+
 	app.StartCamera();
 
-	// Enforce Framerate
+	// Force Framerate
 	if (options->Get().framerate.value_or(0.0) > 0.0)
 	{
-		int64_t frame_time_us = 1000000 / options->Get().framerate.value();
+		float fps = options->Get().framerate.value();
+		int64_t frame_time_us = 1000000 / fps;
+		LOG(1, "Forcing FrameDurationLimits to " << frame_time_us << "us for " << fps << " fps");
 		libcamera::ControlList controls;
 		controls.set(libcamera::controls::FrameDurationLimits, { frame_time_us, frame_time_us });
 		app.SetControls(controls);
@@ -214,71 +271,153 @@ static void event_loop(RPiCamCinemaApp &app)
 
 	disable_auto_exposure(app);
 
-	FrameQueue queue(200);
+	// Buffer depth: 250 frames (~4GB RAM usage for 16MB frames)
+	// We rely on RAM to absorb glitches.
+	unsigned int q_depth = options->QueueDepth();
+	if (q_depth < 250) q_depth = 250; 
+	LOG(1, "Queue depth set to " << q_depth);
+
+	FrameQueue queue(q_depth);
 	std::atomic<uint64_t> written(0);
-	std::vector<FrameJob> meta_jobs;
-	std::mutex meta_mutex;
-	std::thread writer(writer_thread_func, std::ref(queue), std::ref(meta_jobs), std::ref(meta_mutex), std::ref(written));
+	
+	std::vector<FrameJob> deferred_jobs;
+	std::mutex deferred_mutex;
+
+	// Start Single-File Writer
+	std::thread writer(writer_thread_func, std::ref(queue), std::ref(deferred_jobs), 
+	                   std::ref(deferred_mutex), std::ref(written), big_raw_path);
 
 	uint64_t dropped = 0;
+	uint64_t enq = 0;
+
+	FpsWindow fps_cap_window;
+	FpsWindow fps_write_window;
+	auto last_log = std::chrono::steady_clock::now();
+	auto start = last_log;
+	uint64_t written_last = 0;
+
 	uint32_t frame_counter = 1;
-	auto start_time = std::chrono::steady_clock::now();
-	auto last_log = start_time;
 
 	for (;;)
 	{
 		RPiCamApp::Msg msg = app.Wait();
-		if (msg.type == RPiCamApp::MsgType::Timeout) { app.StopCamera(); app.StartCamera(); disable_auto_exposure(app); continue; }
-		if (msg.type == RPiCamApp::MsgType::Quit) break;
-		
+
+		if (msg.type == RPiCamApp::MsgType::Timeout)
+		{
+			LOG_ERROR("ERROR: Device timeout detected, attempting a restart!!!");
+			app.StopCamera();
+			app.StartCamera();
+			disable_auto_exposure(app);
+			continue;
+		}
+		if (msg.type == RPiCamApp::MsgType::Quit)
+			break;
+		if (msg.type != RPiCamApp::MsgType::RequestComplete)
+			throw std::runtime_error("unrecognised message!");
+
 		CompletedRequestPtr &completed = std::get<CompletedRequestPtr>(msg.payload);
-		if (!options->Get().nopreview && app.ViewfinderStream()) app.ShowPreview(completed, app.ViewfinderStream());
+
+		auto now = std::chrono::steady_clock::now();
+		fps_cap_window.push(now);
+
+		if (!options->Get().nopreview && app.ViewfinderStream())
+			app.ShowPreview(completed, app.ViewfinderStream());
 
 		Stream *raw = app.RawStream();
+		if (!raw)
+			throw std::runtime_error("RAW stream not configured/enabled in this mode.");
+
 		StreamInfo info = app.GetStreamInfo(raw);
 		BufferReadSync r(&app, completed->buffers[raw]);
 		const std::vector<libcamera::Span<uint8_t>> mem = r.Get();
 
-		// Calculate total size
 		size_t total = 0;
-		for(auto &s : mem) total += s.size();
+		for (auto const &s : mem)
+			total += s.size();
 
 		FrameJob job;
 		job.info = info;
-		job.raw_filename = make_filename(output_base, options->Reel(), options->Clip(), frame_counter, "raw");
+		job.metadata = completed->metadata;
+		job.filename = make_frame_filename(output_base, options->Reel(), options->Clip(), frame_counter);
 		job.bytes.resize(total);
-		
+
 		size_t off = 0;
-		for(auto &s : mem) { std::memcpy(job.bytes.data() + off, s.data(), s.size()); off += s.size(); }
+		for (auto const &s : mem)
+		{
+			std::memcpy(job.bytes.data() + off, s.data(), s.size());
+			off += s.size();
+		}
 
-		// Extract Metadata
-		auto exp = completed->metadata.get(libcamera::controls::ExposureTime);
-		job.exposure_ms = exp.value_or(0) / 1000.0f;
-		auto gain = completed->metadata.get(libcamera::controls::AnalogueGain);
-		job.gain = gain.value_or(1.0f);
+		if (!queue.try_push(std::move(job)))
+		{
+			dropped++;
+		}
+		else
+		{
+			enq++;
+			frame_counter++;
+		}
 
-		if (!queue.try_push(std::move(job))) dropped++;
-		else frame_counter++;
+		uint64_t written_now = written.load();
+		if (written_now > written_last)
+		{
+			for(uint64_t i=0; i < (written_now - written_last); i++)
+				fps_write_window.push(now);
+			written_last = written_now;
+		}
 
-		auto now = std::chrono::steady_clock::now();
-		if (options->Get().timeout && (now - start_time) > options->Get().timeout.value) break;
+		if (options->Get().timeout && (now - start) > options->Get().timeout.value)
+		{
+			app.StopCamera(); 
+			break;
+		}
 
 		if ((now - last_log) >= 1s)
 		{
-			std::cout << "Frames: " << frame_counter << " Written: " << written << " Dropped: " << dropped << " Queue: " << queue.size() << std::endl;
+			float exp_time = 0;
+			float gain = 0;
+
+			auto exp_val = completed->metadata.get(libcamera::controls::ExposureTime);
+			if (exp_val) exp_time = *exp_val / 1000.0f;
+
+			auto gain_val = completed->metadata.get(libcamera::controls::AnalogueGain);
+			if (gain_val) gain = *gain_val;
+
+			LOG(1, "#" << frame_counter << " (" << fps_cap_window.fps() << " fps) exp " 
+			    << exp_time << " ms ag " << gain
+			    << " fps_write~" << fps_write_window.fps() << " enq=" << enq 
+			    << " written=" << written_now 
+			    << " drop=" << dropped << " q=" << queue.size());
+
 			last_log = now;
 		}
 	}
 
 	queue.stop();
-	if (writer.joinable()) writer.join();
-	
-	save_metadata_json(meta_jobs, clip_dir);
+	if (writer.joinable())
+		writer.join();
+
+	if (!deferred_jobs.empty())
+	{
+		convert_deferred_frames(deferred_jobs, app.CameraModel(), options, big_raw_path);
+	}
 }
 
 int main(int argc, char *argv[])
 {
-	try { RPiCamCinemaApp app; if (app.GetOptions()->Parse(argc, argv)) event_loop(app); }
-	catch (std::exception const &e) { std::cerr << "ERROR: " << e.what() << std::endl; return 1; }
+	try
+	{
+		RPiCamCinemaApp app;
+		CinemaOptions *options = app.GetOptions();
+		if (options->Parse(argc, argv))
+		{
+			event_loop(app);
+		}
+	}
+	catch (std::exception const &e)
+	{
+		LOG_ERROR("ERROR: " << e.what());
+		return 1;
+	}
 	return 0;
 }
