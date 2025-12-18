@@ -3,8 +3,9 @@
  * rpicam_cinema.cpp - Preview-capable RAW CinemaDNG sequence capture app.
  *
  * Performance Optimized:
- * - Single-File Write: Streams all frames to one 'movie.raw' file to maximize NVMe bandwidth.
- * - Deferred Conversion: Extracts DNGs from 'movie.raw' after recording.
+ * - Single-File Write (32MB Buffer): Streams all frames to one 'movie.raw' file.
+ * - Multi-Threaded Conversion: Extracts DNGs from 'movie.raw' in parallel.
+ * - Memory Optimized: Aggressively frees RAM after writing to disk.
  */
 
 #include <atomic>
@@ -23,12 +24,15 @@
 #include <thread>
 #include <vector>
 #include <optional>
+#include <future>
+#include <algorithm>
 
 #include <libcamera/controls.h>
 
 #include "core/rpicam_app.hpp"
 #include "core/stream_info.hpp"
 #include "core/cinema_options.hpp"
+#include "core/buffer_sync.hpp"
 
 #include "image/image.hpp"
 
@@ -155,6 +159,10 @@ static void writer_thread_func(FrameQueue &q, std::vector<FrameJob> &deferred_jo
 		return;
 	}
 
+	// OPTIMIZATION: Use a large write buffer (32MB) to reduce syscalls.
+	std::vector<char> write_buf(1024 * 1024 * 32);
+	setvbuf(fp, write_buf.data(), _IOFBF, write_buf.size());
+
 	FrameJob job;
 	while (q.pop(job))
 	{
@@ -166,9 +174,9 @@ static void writer_thread_func(FrameQueue &q, std::vector<FrameJob> &deferred_jo
 		// Save the size for read-back
 		job.size = job.bytes.size();
 		
-		// Clear memory to free up RAM for the next frames
-		job.bytes.clear();
-		job.bytes.shrink_to_fit();
+		// CRITICAL MEMORY FIX: Force deallocation of vector memory
+		// std::vector::clear() does NOT free memory, only swap does.
+		std::vector<uint8_t>().swap(job.bytes);
 
 		{
 			std::lock_guard<std::mutex> lk(deferred_mutex);
@@ -197,8 +205,30 @@ static void convert_deferred_frames(std::vector<FrameJob> &jobs, std::string con
 		return;
 	}
 
+	// Increase read buffer for faster sequential reading
+	std::vector<char> read_buf(1024 * 1024 * 16);
+	setvbuf(fp, read_buf.data(), _IOFBF, read_buf.size());
+
 	int count = 0;
 	int total = jobs.size();
+
+	// Parallel Processing setup
+	unsigned int max_threads = std::thread::hardware_concurrency();
+	if (max_threads > 1) max_threads -= 1; // Leave one thread for the main reader
+	if (max_threads < 1) max_threads = 1;
+
+	std::vector<std::future<void>> futures;
+	std::cout << "Using " << max_threads << " worker threads for DNG conversion.\n";
+
+	auto process_dng = [&](std::vector<uint8_t> data, FrameJob job_copy) {
+		try {
+			std::vector<libcamera::Span<uint8_t>> mem;
+			mem.emplace_back(data.data(), data.size());
+			dng_save(mem, job_copy.info, job_copy.metadata, job_copy.filename, cam_model, options);
+		} catch (std::exception const &e) {
+			LOG_ERROR("Error processing frame " << job_copy.filename << ": " << e.what());
+		}
+	};
 
 	// We assume jobs are in the same order they were written (FIFO queue)
 	for (auto &job : jobs)
@@ -207,27 +237,36 @@ static void convert_deferred_frames(std::vector<FrameJob> &jobs, std::string con
 		if (count % 10 == 0)
 			std::cout << "Processing " << count << "/" << total << "\r" << std::flush;
 
-		try 
-		{
-			std::vector<uint8_t> data(job.size);
-			size_t r = fread(data.data(), 1, job.size, fp);
-			
-			if (r != job.size) {
-				LOG_ERROR("Read error on frame " << count << ". Expected " << job.size << " got " << r);
-				break;
-			}
-
-			// Construct memory span for dng_save
-			std::vector<libcamera::Span<uint8_t>> mem;
-			mem.emplace_back(data.data(), data.size());
-
-			dng_save(mem, job.info, job.metadata, job.filename, cam_model, options);
+		// Read data sequentially in main thread (IO bound)
+		std::vector<uint8_t> data(job.size);
+		size_t r = fread(data.data(), 1, job.size, fp);
+		
+		if (r != job.size) {
+			LOG_ERROR("Read error on frame " << count << ". Expected " << job.size << " got " << r);
+			break;
 		}
-		catch (std::exception const &e)
-		{
-			LOG_ERROR("Error processing frame " << job.filename << ": " << e.what());
+
+		// Clean up completed futures
+		futures.erase(std::remove_if(futures.begin(), futures.end(), 
+			[](const std::future<void>& f) { 
+				return f.wait_for(std::chrono::seconds(0)) == std::future_status::ready; 
+			}), futures.end());
+
+		// Throttling: if we have max_threads active, wait for one to finish
+		if (futures.size() >= max_threads) {
+			futures.front().wait();
+			futures.erase(futures.begin());
 		}
+
+		// Launch conversion in background (CPU bound)
+		// We copy 'job' (metadata) and move 'data'
+		futures.push_back(std::async(std::launch::async, process_dng, std::move(data), job));
 	}
+
+	// Wait for all remaining tasks
+	for (auto &f : futures)
+		f.wait();
+
 	fclose(fp);
 	
 	// Optional: Remove the big raw file after success
@@ -271,7 +310,7 @@ static void event_loop(RPiCamCinemaApp &app)
 
 	disable_auto_exposure(app);
 
-	// Buffer depth: 250 frames (~4GB RAM usage for 16MB frames)
+	// Buffer depth: 250 frames minimum (~4GB RAM usage for 16MB frames)
 	// We rely on RAM to absorb glitches.
 	unsigned int q_depth = options->QueueDepth();
 	if (q_depth < 250) q_depth = 250; 
@@ -292,10 +331,14 @@ static void event_loop(RPiCamCinemaApp &app)
 
 	FpsWindow fps_cap_window;
 	FpsWindow fps_write_window;
-	auto last_log = std::chrono::steady_clock::now();
-	auto start = last_log;
-	uint64_t written_last = 0;
+	
+	auto start_time = std::chrono::steady_clock::now();
+	auto last_log = start_time;
+	
+	// FIX: Explicitly use std::chrono::milliseconds for timeout
+	auto timeout_val = options->Get().timeout; 
 
+	uint64_t written_last = 0;
 	uint32_t frame_counter = 1;
 
 	for (;;)
@@ -312,95 +355,88 @@ static void event_loop(RPiCamCinemaApp &app)
 		}
 		if (msg.type == RPiCamApp::MsgType::Quit)
 			break;
+		
+		// Manual Timeout Check (Fix for infinite loop and type mismatch)
+		auto now = std::chrono::steady_clock::now();
+		if (timeout_val.value.count() > 0 && (now - start_time) >= timeout_val.value) {
+			LOG(1, "Timeout reached. Stopping capture.");
+			break;
+		}
+
 		if (msg.type != RPiCamApp::MsgType::RequestComplete)
 			throw std::runtime_error("unrecognised message!");
 
 		CompletedRequestPtr &completed = std::get<CompletedRequestPtr>(msg.payload);
 
-		auto now = std::chrono::steady_clock::now();
 		fps_cap_window.push(now);
 
 		if (!options->Get().nopreview && app.ViewfinderStream())
 			app.ShowPreview(completed, app.ViewfinderStream());
 
-		Stream *raw = app.RawStream();
-		if (!raw)
-			throw std::runtime_error("RAW stream not configured/enabled in this mode.");
+		// Process RAW Frame
+		Stream *stream = app.RawStream();
+		if (!stream) throw std::runtime_error("Raw stream not found");
 
-		StreamInfo info = app.GetStreamInfo(raw);
-		BufferReadSync r(&app, completed->buffers[raw]);
-		const std::vector<libcamera::Span<uint8_t>> mem = r.Get();
-
-		size_t total = 0;
-		for (auto const &s : mem)
-			total += s.size();
-
+		// Prepare Job
 		FrameJob job;
-		job.info = info;
+		job.info = app.GetStreamInfo(stream);
 		job.metadata = completed->metadata;
-		job.filename = make_frame_filename(output_base, options->Reel(), options->Clip(), frame_counter);
-		job.bytes.resize(total);
+		job.filename = make_frame_filename(output_base, options->Reel(), options->Clip(), frame_counter++);
 
-		size_t off = 0;
-		for (auto const &s : mem)
-		{
-			std::memcpy(job.bytes.data() + off, s.data(), s.size());
-			off += s.size();
+		// Copy Data using BufferReadSync (Fix for Mmap error)
+		BufferReadSync r(&app, completed->buffers[stream]);
+		const std::vector<libcamera::Span<uint8_t>> mem = r.Get();
+		
+		if (!mem.empty()) {
+			job.bytes.assign(mem[0].data(), mem[0].data() + mem[0].size());
+			job.size = job.bytes.size();
+
+			// Push to Queue
+			if (queue.try_push(std::move(job)))
+			{
+				enq++;
+			}
+			else
+			{
+				dropped++;
+				LOG(2, "Queue full! Dropped frame " << (frame_counter - 1));
+			}
 		}
 
-		if (!queue.try_push(std::move(job)))
+		// Statistics
+		if (now - last_log >= 2s)
 		{
-			dropped++;
-		}
-		else
-		{
-			enq++;
-			frame_counter++;
-		}
+			uint64_t w_total = written.load(std::memory_order_relaxed);
+			uint64_t w_diff = w_total - written_last;
+			
+			// Hack: push timestamp for every written frame to approximate write FPS
+			for(uint64_t k=0; k<w_diff; k++) fps_write_window.push(now);
+			written_last = w_total;
 
-		uint64_t written_now = written.load();
-		if (written_now > written_last)
-		{
-			for(uint64_t i=0; i < (written_now - written_last); i++)
-				fps_write_window.push(now);
-			written_last = written_now;
-		}
-
-		if (options->Get().timeout && (now - start) > options->Get().timeout.value)
-		{
-			app.StopCamera(); 
-			break;
-		}
-
-		if ((now - last_log) >= 1s)
-		{
-			float exp_time = 0;
-			float gain = 0;
-
-			auto exp_val = completed->metadata.get(libcamera::controls::ExposureTime);
-			if (exp_val) exp_time = *exp_val / 1000.0f;
-
-			auto gain_val = completed->metadata.get(libcamera::controls::AnalogueGain);
-			if (gain_val) gain = *gain_val;
-
-			LOG(1, "#" << frame_counter << " (" << fps_cap_window.fps() << " fps) exp " 
-			    << exp_time << " ms ag " << gain
-			    << " fps_write~" << fps_write_window.fps() << " enq=" << enq 
-			    << " written=" << written_now 
-			    << " drop=" << dropped << " q=" << queue.size());
+			double fps_cap = fps_cap_window.fps();
+			double fps_wrt = fps_write_window.fps();
+			
+			LOG(1, "Cap: " << fps_cap << " fps, Wrt: " << fps_wrt << " fps, Q: " << queue.size() 
+			    << "/" << q_depth << ", Drop: " << dropped << " Total: " << enq);
 
 			last_log = now;
 		}
 	}
 
-	queue.stop();
-	if (writer.joinable())
-		writer.join();
+	auto end = std::chrono::steady_clock::now();
+	std::cout << "\nStopping...\n";
 
-	if (!deferred_jobs.empty())
-	{
-		convert_deferred_frames(deferred_jobs, app.CameraModel(), options, big_raw_path);
-	}
+	queue.stop();
+	writer.join();
+
+	double seconds = std::chrono::duration<double>(end - start_time).count();
+	std::cout << "Captured " << enq << " frames in " << seconds << " seconds (" << (enq/seconds) << " fps)\n";
+	std::cout << "Dropped " << dropped << " frames.\n";
+
+	app.StopCamera();
+
+	// Post-Processing Phase
+	convert_deferred_frames(deferred_jobs, app.CameraModel(), options, big_raw_path);
 }
 
 int main(int argc, char *argv[])
@@ -411,6 +447,8 @@ int main(int argc, char *argv[])
 		CinemaOptions *options = app.GetOptions();
 		if (options->Parse(argc, argv))
 		{
+			// if (options->verbose >= 2) options->Print();
+
 			event_loop(app);
 		}
 	}
